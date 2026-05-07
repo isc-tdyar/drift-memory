@@ -16,10 +16,12 @@ Usage:
     memory = db.get_memory('abc12345')
 """
 
+import atexit
 import fcntl
 import json
 import math
 import os
+import signal
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
@@ -27,12 +29,38 @@ from typing import Optional
 
 
 # ---------------------------------------------------------------------------
-# IRIS connection — env-var driven, defaults to kg-iris (localhost:11982).
-# Uses a persistent module-level connection; conn.close() hangs on some
-# intersystems-irispython versions on macOS so we reuse rather than close.
+# IRIS connection — env-var driven, defaults to los-iris (localhost:11972).
+# Uses a persistent module-level connection reused across calls in a process.
+# conn.close() was observed to hang on some intersystems-irispython/macOS
+# combos, so we close via atexit with a SIGALRM timeout to avoid blocking
+# while still releasing the IRIS license unit on process exit.
 # ---------------------------------------------------------------------------
 
 _persistent_conn = None
+
+
+def _close_on_exit():
+    global _persistent_conn
+    if _persistent_conn is None:
+        return
+    conn = _persistent_conn
+    _persistent_conn = None
+    # Use SIGALRM to cap the close() call at 2s — prevents zombie license units
+    # without risking an indefinite hang at shutdown.
+    def _timeout_handler(signum, frame):
+        raise TimeoutError("conn.close() timed out")
+    old_handler = signal.signal(signal.SIGALRM, _timeout_handler)
+    signal.alarm(2)
+    try:
+        conn.close()
+    except Exception:
+        pass
+    finally:
+        signal.alarm(0)
+        signal.signal(signal.SIGALRM, old_handler)
+
+
+atexit.register(_close_on_exit)
 
 
 def _get_connection():
@@ -48,7 +76,7 @@ def _get_connection():
 
     import iris as _iris
     host     = os.environ.get("IRIS_HOST",      "localhost")
-    port     = int(os.environ.get("IRIS_PORT",  "11982"))
+    port     = int(os.environ.get("IRIS_PORT",  "11972"))
     ns       = os.environ.get("IRIS_NAMESPACE", "USER")
     user     = os.environ.get("IRIS_USERNAME",  "SuperUser")
     password = os.environ.get("IRIS_PASSWORD",  "SYS")
