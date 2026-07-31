@@ -142,6 +142,35 @@ def _get_minilm_encoder():
     return _minilm_encoder if _minilm_encoder is not False else None
 
 
+#: Vector column per embedding dimension. Widths are fixed in the DDL (`_EMBEDDINGS_SQL`)
+#: and IRIS validates them, so the caller's dimension decides the column — assuming one
+#: column meant a 384-dim caller hit `SQLCODE -104` on every write.
+_VECTOR_COLUMN_BY_DIM = {1536: 'emb', 384: 'emb_384'}
+
+_vector_fallback_warned = False
+
+
+def _warn_vector_fallback(exc: Exception):
+    """Warn once per process when a vector-column write falls back to text-only.
+
+    The fallback is legitimate on instances without the emb/emb_384 VECTOR
+    columns, but a *permanent* failure here silently NULLs every vector and
+    VECTOR_COSINE then scores all rows 0.0 — i.e. semantic recall dies quietly.
+    A bare `except` once hid exactly that for 6,493 rows. Keep this audible.
+    """
+    global _vector_fallback_warned
+    if _vector_fallback_warned:
+        return
+    _vector_fallback_warned = True
+    import sys as _sys
+    print(
+        f"[drift-memory] WARNING: vector-column write failed, falling back to "
+        f"text-only embedding storage. Semantic search will not use "
+        f"VECTOR_COSINE until this is fixed. Cause: {type(exc).__name__}: {exc}",
+        file=_sys.stderr,
+    )
+
+
 def _encode_384(text: str) -> Optional[list]:
     """Encode text to 384-dim using all-MiniLM-L6-v2. Returns None on failure."""
     enc = _get_minilm_encoder()
@@ -841,13 +870,37 @@ class MemoryDB:
 
     def store_embedding(self, memory_id: str, embedding: list,
                         preview: str = '', model: str = 'unknown'):
+        """Upsert the text embedding plus whichever VECTOR columns the values fit.
+
+        Both vector columns are FIXED width (`emb` VECTOR(DOUBLE, 1536), `emb_384`
+        VECTOR(DOUBLE, 384)) and IRIS enforces it — a 384-dim value into `emb` raises
+        `SQLCODE -104 … failed validation`. So the caller's `embedding` is routed to the
+        column matching its dimension rather than assumed to be the 1536-dim one: every
+        consumer in LOS is `all-MiniLM-L6-v2` at 384 dims, and those writes were failing.
+
+        The columns are also written INDEPENDENTLY. Previously one `try` wrote both and a
+        single `except` fell back to text-only, so one bad width discarded the other
+        column's perfectly valid value: a 384-dim caller lost `emb_384` as well as `emb`,
+        landed with no vectors at all, and could not be found by semantic search
+        afterwards. Whatever fits is now kept.
+        """
         emb_str = json.dumps(embedding)
         preview_str = preview[:500] if preview else ''
         now = _now_iso()
 
-        # Compute 384-dim all-MiniLM embedding from preview text (best-effort)
+        # Route the caller's vector to the column of its width. An unrecognised dimension
+        # gets no vector column — better than a guaranteed -104 — but the text `embedding`
+        # column still holds it, so nothing is lost outright.
+        vectors = {}
+        if len(embedding) in _VECTOR_COLUMN_BY_DIM:
+            vectors[_VECTOR_COLUMN_BY_DIM[len(embedding)]] = emb_str
+
+        # 384-dim all-MiniLM embedding of the preview text (best-effort). Independent of the
+        # caller's dimension: for a 1536-dim caller this is the only thing populating
+        # emb_384, and for a 384-dim caller it simply agrees with the routed value.
         emb_384_vec = _encode_384(preview_str) if preview_str else None
-        emb_384_str = json.dumps(emb_384_vec) if emb_384_vec else None
+        if emb_384_vec:
+            vectors.setdefault('emb_384', json.dumps(emb_384_vec))
 
         with self._conn() as conn:
             cur = conn.cursor()
@@ -857,62 +910,29 @@ class MemoryDB:
             )
             exists = cur.fetchone()
             if exists:
-                if emb_384_str:
-                    try:
-                        cur.execute(f"""
-                            UPDATE {self._t('text_embeddings')}
-                            SET embedding = ?, emb = TO_VECTOR(?, DOUBLE),
-                                emb_384 = TO_VECTOR(?, DOUBLE),
-                                preview = ?, model = ?, indexed_at = ?
-                            WHERE memory_id = ?
-                        """, [emb_str, emb_str, emb_384_str, preview_str, model, now, memory_id])
-                    except Exception:
-                        cur.execute(f"""
-                            UPDATE {self._t('text_embeddings')}
-                            SET embedding = ?, preview = ?, model = ?, indexed_at = ?
-                            WHERE memory_id = ?
-                        """, [emb_str, preview_str, model, now, memory_id])
-                else:
-                    try:
-                        cur.execute(f"""
-                            UPDATE {self._t('text_embeddings')}
-                            SET embedding = ?, emb = TO_VECTOR(?, DOUBLE),
-                                preview = ?, model = ?, indexed_at = ?
-                            WHERE memory_id = ?
-                        """, [emb_str, emb_str, preview_str, model, now, memory_id])
-                    except Exception:
-                        cur.execute(f"""
-                            UPDATE {self._t('text_embeddings')}
-                            SET embedding = ?, preview = ?, model = ?, indexed_at = ?
-                            WHERE memory_id = ?
-                        """, [emb_str, preview_str, model, now, memory_id])
+                cur.execute(f"""
+                    UPDATE {self._t('text_embeddings')}
+                    SET embedding = ?, preview = ?, model = ?, indexed_at = ?
+                    WHERE memory_id = ?
+                """, [emb_str, preview_str, model, now, memory_id])
             else:
-                if emb_384_str:
-                    try:
-                        cur.execute(f"""
-                            INSERT INTO {self._t('text_embeddings')}
-                            (memory_id, embedding, emb, emb_384, preview, model, indexed_at)
-                            VALUES (?, TO_VECTOR(?, DOUBLE), TO_VECTOR(?, DOUBLE), ?, ?, ?)
-                        """, [memory_id, emb_str, emb_str, emb_384_str, preview_str, model, now])
-                    except Exception:
-                        cur.execute(f"""
-                            INSERT INTO {self._t('text_embeddings')}
-                            (memory_id, embedding, preview, model, indexed_at)
-                            VALUES (?, ?, ?, ?, ?)
-                        """, [memory_id, emb_str, preview_str, model, now])
-                else:
-                    try:
-                        cur.execute(f"""
-                            INSERT INTO {self._t('text_embeddings')}
-                            (memory_id, embedding, emb, preview, model, indexed_at)
-                            VALUES (?, TO_VECTOR(?, DOUBLE), ?, ?, ?)
-                        """, [memory_id, emb_str, emb_str, preview_str, model, now])
-                    except Exception:
-                        cur.execute(f"""
-                            INSERT INTO {self._t('text_embeddings')}
-                            (memory_id, embedding, preview, model, indexed_at)
-                            VALUES (?, ?, ?, ?, ?)
-                        """, [memory_id, emb_str, preview_str, model, now])
+                cur.execute(f"""
+                    INSERT INTO {self._t('text_embeddings')}
+                    (memory_id, embedding, preview, model, indexed_at)
+                    VALUES (?, ?, ?, ?, ?)
+                """, [memory_id, emb_str, preview_str, model, now])
+
+            # One statement per vector column, so a width mismatch or a missing column on
+            # an older instance costs only that column.
+            for column, value in vectors.items():
+                try:
+                    cur.execute(f"""
+                        UPDATE {self._t('text_embeddings')}
+                        SET {column} = TO_VECTOR(?, DOUBLE)
+                        WHERE memory_id = ?
+                    """, [value, memory_id])
+                except Exception as exc:
+                    _warn_vector_fallback(exc)
         self._flog.write("upsert", "text_embeddings", {
             "memory_id": memory_id, "preview": preview[:500] if preview else '',
             "model": model, "embedding_len": len(embedding),
@@ -936,30 +956,20 @@ class MemoryDB:
         with self._conn() as conn:
             cur = conn.cursor()
             try:
-                # Fast path: VECTOR_COSINE against appropriate emb column
-                if type_filter:
-                    cur.execute(f"""
-                        SELECT TOP ? e.memory_id,
-                               VECTOR_COSINE(e.{emb_col}, TO_VECTOR(?, DOUBLE)) AS similarity,
-                               e.preview
-                        FROM {self._t('text_embeddings')} e
-                        JOIN {self._t('memories')} m ON m.id = e.memory_id
-                        WHERE m.type_ = ? AND e.{emb_not_null}
-                        ORDER BY similarity DESC
-                    """, [limit, query_vec_str, type_filter])
-                else:
-                    cur.execute(f"""
-                        SELECT TOP ? e.memory_id,
-                               VECTOR_COSINE(e.{emb_col}, TO_VECTOR(?, DOUBLE)) AS similarity,
-                               e.preview
-                        FROM {self._t('text_embeddings')} e
-                        WHERE e.{emb_not_null}
-                        ORDER BY similarity DESC
-                    """, [limit, query_vec_str])
+                # Fast path: VECTOR_COSINE — no JOIN (avoids %qaqpre singletonGroups
+                # compile crash on migrated IRIS instances; type_filter applied in
+                # Python after fetching memory details).
+                cur.execute(f"""
+                    SELECT TOP ? e.memory_id,
+                           VECTOR_COSINE(e.{emb_col}, TO_VECTOR(?, DOUBLE)) AS similarity,
+                           e.preview
+                    FROM {self._t('text_embeddings')} e
+                    WHERE e.{emb_not_null}
+                    ORDER BY similarity DESC
+                """, [limit * 4 if type_filter else limit, query_vec_str])
 
                 rows = cur.fetchall()
                 if rows:
-                    # Fetch memory details for each result
                     results = []
                     for row in rows:
                         memory_id, similarity, preview = row[0], row[1], row[2]
@@ -968,47 +978,48 @@ class MemoryDB:
                         except (TypeError, ValueError):
                             similarity = 0.0
                         mem = self.get_memory(memory_id) or {'id': memory_id}
+                        if type_filter and mem.get('type_') != type_filter:
+                            continue
                         mem['preview'] = preview or ''
                         mem['similarity'] = similarity
                         results.append(mem)
-                    return results
+                        if len(results) >= limit:
+                            break
+                    if results:
+                        return results
 
                 # emb column empty — fall through to Python scan
             except Exception:
                 pass  # VECTOR_COSINE failed — fall through to Python fallback
 
-            # Python fallback: full-table scan with cosine similarity
+            # Python fallback: full-table scan — no JOIN (same %qaqpre guard);
+            # fetch embeddings then memories separately.
+            cur.execute(f"""
+                SELECT e.memory_id, e.preview, e.embedding
+                FROM {self._t('text_embeddings')} e
+            """)
+            emb_rows = cur.fetchall()
             if type_filter:
+                # Fetch all memory IDs matching type in a second query (no JOIN)
                 cur.execute(f"""
-                    SELECT e.memory_id, e.preview, e.embedding, m.*
-                    FROM {self._t('text_embeddings')} e
-                    JOIN {self._t('memories')} m ON m.id = e.memory_id
-                    WHERE m.type_ = ?
+                    SELECT id FROM {self._t('memories')} WHERE type_ = ?
                 """, [type_filter])
+                allowed_ids = {r[0] for r in cur.fetchall()}
             else:
-                cur.execute(f"""
-                    SELECT e.memory_id, e.preview, e.embedding, m.*
-                    FROM {self._t('text_embeddings')} e
-                    JOIN {self._t('memories')} m ON m.id = e.memory_id
-                """)
-            rows = cur.fetchall()
-            cols = _cursor_columns(cur)
+                allowed_ids = None
 
         scored = []
-        for row in rows:
-            d = dict(zip(cols, row))
-            emb_raw = d.get('embedding', '[]')
+        for row in emb_rows:
+            memory_id, preview, emb_raw = row[0], row[1], row[2]
+            if allowed_ids is not None and memory_id not in allowed_ids:
+                continue
             try:
                 emb = json.loads(emb_raw) if isinstance(emb_raw, str) else emb_raw
             except Exception:
                 continue
             sim = _cosine_similarity(query_embedding, emb)
-            mem = _memory_row_to_dict(
-                [d.get(c) for c in cols[3:]],  # skip memory_id, preview, embedding
-                cols[3:]
-            )
-            mem['id'] = d.get('memory_id', '')
-            mem['preview'] = d.get('preview', '')
+            mem = self.get_memory(memory_id) or {'id': memory_id}
+            mem['preview'] = preview or ''
             mem['similarity'] = sim
             scored.append(mem)
 
