@@ -74,13 +74,18 @@ def _get_connection():
         except Exception:
             _persistent_conn = None
 
-    import iris as _iris
     host     = os.environ.get("IRIS_HOST",      "localhost")
     port     = int(os.environ.get("IRIS_PORT",  "11972"))
     ns       = os.environ.get("IRIS_NAMESPACE", "USER")
     user     = os.environ.get("IRIS_USERNAME",  "SuperUser")
     password = os.environ.get("IRIS_PASSWORD",  "SYS")
-    _persistent_conn = _iris.connect(host, port, ns, user, password)
+    # iris.dbapi.connect() returns a Connection whose cursors are iris.dbapi.Cursor,
+    # which includes the fetchall/fetchone chunked fallback for the irispython 5.3.0+
+    # read-ahead buffer bug (DP-445872 / "Character stream length mismatch").
+    import iris.dbapi as _dbapi
+    _persistent_conn = _dbapi.connect(
+        hostname=host, port=port, namespace=ns, username=user, password=password
+    )
     return _persistent_conn
 
 
