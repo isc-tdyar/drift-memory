@@ -59,13 +59,13 @@ def _strip_prefix(node_id: str) -> str:
 
 def _get_conn():
     import os
-    import iris as _iris
+    import iris.dbapi as _dbapi
     host     = os.environ.get("IRIS_HOST",      "localhost")
     port     = int(os.environ.get("IRIS_PORT",  "11982"))
     ns       = os.environ.get("IRIS_NAMESPACE", "USER")
     user     = os.environ.get("IRIS_USERNAME",  "SuperUser")
     password = os.environ.get("IRIS_PASSWORD",  "SYS")
-    return _iris.connect(host, port, ns, user, password)
+    return _dbapi.connect(hostname=host, port=port, namespace=ns, username=user, password=password)
 
 
 class IVGBridge:
