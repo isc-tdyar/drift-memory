@@ -63,6 +63,21 @@ def _close_on_exit():
 atexit.register(_close_on_exit)
 
 
+def connection_params() -> dict:
+    """The one place a drift-memory connection's target is decided (ivg_bridge too).
+
+    11972 is productivity-framework's los-iris on both hosts. ivg_bridge once carried
+    its own default (11982), so a memory and its Graph_KG mirror dialed different ports.
+    """
+    return dict(
+        hostname=os.environ.get("IRIS_HOST", "localhost"),
+        port=int(os.environ.get("IRIS_PORT", "11972")),
+        namespace=os.environ.get("IRIS_NAMESPACE", "USER"),
+        username=os.environ.get("IRIS_USERNAME", "SuperUser"),
+        password=os.environ.get("IRIS_PASSWORD", "SYS"),
+    )
+
+
 def _get_connection():
     global _persistent_conn
     if _persistent_conn is not None:
@@ -74,18 +89,12 @@ def _get_connection():
         except Exception:
             _persistent_conn = None
 
-    host     = os.environ.get("IRIS_HOST",      "localhost")
-    port     = int(os.environ.get("IRIS_PORT",  "11972"))
-    ns       = os.environ.get("IRIS_NAMESPACE", "USER")
-    user     = os.environ.get("IRIS_USERNAME",  "SuperUser")
-    password = os.environ.get("IRIS_PASSWORD",  "SYS")
+    params = connection_params()
     # iris.dbapi.connect() returns a Connection whose cursors are iris.dbapi.Cursor,
     # which includes the fetchall/fetchone chunked fallback for the irispython 5.3.0+
     # read-ahead buffer bug (DP-445872 / "Character stream length mismatch").
     import iris.dbapi as _dbapi
-    _persistent_conn = _dbapi.connect(
-        hostname=host, port=port, namespace=ns, username=user, password=password
-    )
+    _persistent_conn = _dbapi.connect(**params)
     return _persistent_conn
 
 
