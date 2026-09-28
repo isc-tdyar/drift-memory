@@ -63,6 +63,34 @@ def _close_on_exit():
 atexit.register(_close_on_exit)
 
 
+# store_memory() finishes on daemon threads that make network calls. A process that
+# exits while one is inside native code SIGSEGVs in finalization — vault-ingestion
+# exited -11 on 41 of 204 runs that way, after its work had completed (2026-09-28).
+# So exit waits for them, bounded, BEFORE the connection closes: registered after
+# _close_on_exit because atexit runs handlers last-in, first-out. Threads are matched
+# by target name (Python names them "Thread-N (<target>)").
+BACKGROUND_TARGETS = ("_classify_bg", "_extract_bg", "_contradict_bg", "_kg_extract_bg")
+BACKGROUND_JOIN_S = 30.0
+
+
+def _join_background_on_exit():
+    import threading
+    import time
+
+    deadline = time.monotonic() + BACKGROUND_JOIN_S
+    suffixes = tuple(f"({name})" for name in BACKGROUND_TARGETS)
+    for t in threading.enumerate():
+        if t is threading.current_thread() or not t.name.endswith(suffixes):
+            continue
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
+        t.join(remaining)
+
+
+atexit.register(_join_background_on_exit)
+
+
 def connection_params() -> dict:
     """The one place a drift-memory connection's target is decided (ivg_bridge too).
 
