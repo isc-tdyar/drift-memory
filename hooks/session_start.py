@@ -592,10 +592,7 @@ def _task_priming(memory_dir, debug):
 def _get_db_for_hook(memory_dir):
     """Get DB instance for the hook (based on which project we're in)."""
     try:
-        db_root = str(memory_dir.parent.parent / "memorydatabase" / "database")
-        if db_root not in sys.path:
-            sys.path.insert(0, db_root)
-        from db import MemoryDB
+        from database.db import MemoryDB
         schema = 'spin' if 'Moltbook2' in str(memory_dir) else 'drift'
         return MemoryDB(schema=schema)
     except Exception:

@@ -30,9 +30,15 @@ MAX_SIMILAR_CHECK = 5
 
 def _nli_available() -> bool:
     """Check if NLI service is reachable."""
+    import socket as _socket
     try:
+        # Use raw socket with short connect timeout to avoid blocking daemon-thread teardown.
+        # urllib.urlopen holds a socket in readinto() which segfaults on interpreter shutdown.
+        sock = _socket.create_connection(("localhost", 8082), timeout=1.0)
+        sock.close()
+        # Service port is open — do the health HTTP check with a tight timeout
         req = urllib.request.Request(f"{NLI_ENDPOINT}/health", method='GET')
-        with urllib.request.urlopen(req, timeout=3) as resp:
+        with urllib.request.urlopen(req, timeout=1) as resp:
             data = json.loads(resp.read().decode('utf-8'))
             return data.get('status') == 'ready'
     except Exception:

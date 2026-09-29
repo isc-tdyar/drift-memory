@@ -953,10 +953,7 @@ def _resolve_telegram_bot(cwd=None):
 def _get_db_for_stats(memory_dir):
     """Get DB instance for stats. Returns None if unavailable."""
     try:
-        db_root = str(memory_dir.parent.parent / "memorydatabase" / "database")
-        if db_root not in sys.path:
-            sys.path.insert(0, db_root)
-        from db import MemoryDB
+        from database.db import MemoryDB
         schema = 'spin' if 'Moltbook2' in str(memory_dir) else 'drift'
         return MemoryDB(schema=schema)
     except Exception:

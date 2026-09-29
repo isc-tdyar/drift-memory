@@ -14,12 +14,6 @@ Usage:
 """
 
 import sys
-from pathlib import Path
-
-# Add memorydatabase to path
-_DB_PATH = Path(__file__).parent.parent.parent / "memorydatabase"
-if str(_DB_PATH) not in sys.path:
-    sys.path.insert(0, str(_DB_PATH))
 
 _db_instance = None
 
@@ -28,10 +22,6 @@ def get_db():
     """Get the Drift MemoryDB instance (lazy singleton). Raises if DB unreachable."""
     global _db_instance
     if _db_instance is None:
-        # Ensure memorydatabase is in sys.path (may have been removed by
-        # toolkit.py's resolve_module which saves/restores sys.path)
-        if str(_DB_PATH) not in sys.path:
-            sys.path.insert(0, str(_DB_PATH))
         from database.db import MemoryDB
         _db_instance = MemoryDB(schema='drift')
     return _db_instance

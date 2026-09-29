@@ -144,7 +144,8 @@ def store_memory(
     emotion: float = 0.5,
     title: str = None,
     caused_by: list[str] = None,
-    event_time: str = None
+    event_time: str = None,
+    source: str = None,
 ) -> tuple[str, str]:
     """
     Store a new memory to PostgreSQL. DB-only, no file writes.
@@ -216,6 +217,7 @@ def store_memory(
             'event_time': event,
         },
         created=now,
+        source=source,
     )
 
     # N1 v1.2: Stamp mood valence on new memories at creation
@@ -293,16 +295,25 @@ def store_memory(
     except Exception:
         pass  # Evidence classification failure shouldn't block store
 
-    # Contradiction check (background thread — needs embedding index, runs after embed)
+    # Contradiction check (background thread — needs embedding index, runs after embed).
+    # Guard: only spawn if NLI port is reachable (avoids daemon-thread socket teardown segfault).
     try:
+        import socket as _socket
         import threading
-        def _contradict_bg(mid, text):
-            try:
-                from contradiction_detector import check_contradictions
-                check_contradictions(text, mid)
-            except Exception:
-                pass
-        threading.Thread(target=_contradict_bg, args=(memory_id, content), daemon=True).start()
+        try:
+            _s = _socket.create_connection(("localhost", 8082), timeout=0.2)
+            _s.close()
+            _nli_reachable = True
+        except Exception:
+            _nli_reachable = False
+        if _nli_reachable:
+            def _contradict_bg(mid, text):
+                try:
+                    from contradiction_detector import check_contradictions
+                    check_contradictions(text, mid)
+                except Exception:
+                    pass
+            threading.Thread(target=_contradict_bg, args=(memory_id, content), daemon=True).start()
     except Exception:
         pass
 

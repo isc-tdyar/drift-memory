@@ -46,22 +46,14 @@ if __name__ == '__main__':
 MEMORY_ROOT = Path(__file__).parent
 SESSION_HOURS = 18  # approximate hours per session (actual: ~1.3 sessions/day = ~18h)
 
-# DB path for memorydatabase
-_DB_ROOT = Path(__file__).parent.parent.parent / "memorydatabase" / "database"
-
-
 def _get_schema() -> str:
     """Determine schema from project path."""
     return 'spin' if 'Moltbook2' in str(MEMORY_ROOT) else 'drift'
 
 
 def _get_db():
-    """Get a MemoryDB instance. Raises if unavailable — DB is required."""
-    import sys as _sys
-    db_root = str(_DB_ROOT)
-    if db_root not in _sys.path:
-        _sys.path.insert(0, db_root)
-    from db import MemoryDB
+    """Get a MemoryDB instance (IRIS backend). Raises if unavailable."""
+    from database.db import MemoryDB
     return MemoryDB(schema=_get_schema())
 
 

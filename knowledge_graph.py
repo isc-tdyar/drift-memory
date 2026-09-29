@@ -23,7 +23,6 @@ import sys
 from datetime import datetime, timezone
 from typing import Optional
 
-import psycopg2.extras
 from db_adapter import get_db, db_to_file_metadata
 
 # --- Relationship Types ---
@@ -54,83 +53,128 @@ RELATIONSHIP_TYPES = {
 def add_edge(source_id: str, target_id: str, relationship: str,
              confidence: float = 0.8, evidence: str = None,
              auto_extracted: bool = False) -> Optional[dict]:
-    """Add a typed relationship. Upserts on (source, target, rel)."""
+    """Add a typed relationship. Upserts on (source, target, rel). IRIS-compatible.
+
+    Dual-writes to both DriftMem_drift_typed_edges (source of truth) and
+    Graph_KG.rdf_edges (IVG traversal index) so khop(), Cypher, and PPR
+    work natively over drift-memory graphs.
+    """
     if relationship not in RELATIONSHIP_TYPES:
         return None
 
     db = get_db()
+    table = db._table('typed_edges')
+    from database.db import _now_iso
+    created_ts = _now_iso()
+
     with db._conn() as conn:
-        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
-            cur.execute(f"""
-                INSERT INTO {db._table('typed_edges')}
-                (source_id, target_id, relationship, confidence, evidence, auto_extracted, created)
-                VALUES (%s, %s, %s, %s, %s, %s, NOW())
-                ON CONFLICT (source_id, target_id, relationship)
-                DO UPDATE SET confidence = GREATEST(
-                    {db._table('typed_edges')}.confidence, EXCLUDED.confidence
-                ),
-                evidence = COALESCE(EXCLUDED.evidence, {db._table('typed_edges')}.evidence),
-                auto_extracted = EXCLUDED.auto_extracted
-                RETURNING *
-            """, (source_id, target_id, relationship, confidence, evidence, auto_extracted))
-            row = cur.fetchone()
-            return dict(row) if row else None
+        cur = conn.cursor(cursor_factory=True)
+        # Check if edge already exists
+        cur.execute(
+            f"SELECT source_id, target_id, relationship, confidence, evidence, auto_extracted, created "
+            f"FROM {table} WHERE source_id = ? AND target_id = ? AND relationship = ?",
+            [source_id, target_id, relationship]
+        )
+        existing = cur.fetchone()
+        if existing:
+            # Update: keep max confidence, preserve existing evidence if new is None
+            new_confidence = max(float(existing['confidence'] or 0), float(confidence))
+            new_evidence = evidence if evidence is not None else existing.get('evidence')
+            cur.execute(
+                f"UPDATE {table} SET confidence = ?, evidence = ?, auto_extracted = ? "
+                f"WHERE source_id = ? AND target_id = ? AND relationship = ?",
+                [new_confidence, new_evidence, 1 if auto_extracted else 0,
+                 source_id, target_id, relationship]
+            )
+            result = {
+                'source_id': source_id, 'target_id': target_id,
+                'relationship': relationship, 'confidence': new_confidence,
+                'evidence': new_evidence, 'auto_extracted': auto_extracted,
+                'created': existing.get('created'),
+            }
+        else:
+            cur.execute(
+                f"INSERT INTO {table} "
+                f"(source_id, target_id, relationship, confidence, evidence, auto_extracted, created) "
+                f"VALUES (?, ?, ?, ?, ?, ?, ?)",
+                [source_id, target_id, relationship, confidence, evidence,
+                 1 if auto_extracted else 0, created_ts]
+            )
+            result = {
+                'source_id': source_id, 'target_id': target_id,
+                'relationship': relationship, 'confidence': confidence,
+                'evidence': evidence, 'auto_extracted': auto_extracted,
+                'created': created_ts,
+            }
+
+    # Mirror into Graph_KG.rdf_edges for native IVG traversal (khop, Cypher, PPR)
+    try:
+        from ivg_bridge import get_bridge
+        get_bridge().register_edge(
+            source_id, target_id, relationship,
+            confidence=result['confidence'],
+            evidence=result.get('evidence'),
+            auto_extracted=auto_extracted,
+        )
+    except Exception:
+        pass  # Bridge is best-effort — never block edge writes
+
+    return result
 
 
 def get_edges_from(source_id: str, relationship: str = None) -> list[dict]:
     """Get outgoing typed edges from a source memory."""
     db = get_db()
     with db._conn() as conn:
-        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
-            if relationship:
-                cur.execute(f"""
-                    SELECT * FROM {db._table('typed_edges')}
-                    WHERE source_id = %s AND relationship = %s
-                    ORDER BY confidence DESC
-                """, (source_id, relationship))
-            else:
-                cur.execute(f"""
-                    SELECT * FROM {db._table('typed_edges')}
-                    WHERE source_id = %s
-                    ORDER BY relationship, confidence DESC
-                """, (source_id,))
-            return [dict(r) for r in cur.fetchall()]
+        cur = conn.cursor(cursor_factory=True)
+        if relationship:
+            cur.execute(
+                f"SELECT * FROM {db._table('typed_edges')} "
+                f"WHERE source_id = ? AND relationship = ? ORDER BY confidence DESC",
+                [source_id, relationship]
+            )
+        else:
+            cur.execute(
+                f"SELECT * FROM {db._table('typed_edges')} "
+                f"WHERE source_id = ? ORDER BY relationship, confidence DESC",
+                [source_id]
+            )
+        return [dict(r) for r in cur.fetchall()]
 
 
 def get_edges_to(target_id: str, relationship: str = None) -> list[dict]:
     """Get incoming typed edges to a target memory."""
     db = get_db()
     with db._conn() as conn:
-        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
-            if relationship:
-                cur.execute(f"""
-                    SELECT * FROM {db._table('typed_edges')}
-                    WHERE target_id = %s AND relationship = %s
-                    ORDER BY confidence DESC
-                """, (target_id, relationship))
-            else:
-                cur.execute(f"""
-                    SELECT * FROM {db._table('typed_edges')}
-                    WHERE target_id = %s
-                    ORDER BY relationship, confidence DESC
-                """, (target_id,))
-            return [dict(r) for r in cur.fetchall()]
+        cur = conn.cursor(cursor_factory=True)
+        if relationship:
+            cur.execute(
+                f"SELECT * FROM {db._table('typed_edges')} "
+                f"WHERE target_id = ? AND relationship = ? ORDER BY confidence DESC",
+                [target_id, relationship]
+            )
+        else:
+            cur.execute(
+                f"SELECT * FROM {db._table('typed_edges')} "
+                f"WHERE target_id = ? ORDER BY relationship, confidence DESC",
+                [target_id]
+            )
+        return [dict(r) for r in cur.fetchall()]
 
 
 def get_all_edges(memory_id: str) -> list[dict]:
     """Get all typed edges involving a memory (both directions)."""
     db = get_db()
     with db._conn() as conn:
-        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
-            cur.execute(f"""
-                SELECT *, 'outgoing' as direction FROM {db._table('typed_edges')}
-                WHERE source_id = %s
-                UNION ALL
-                SELECT *, 'incoming' as direction FROM {db._table('typed_edges')}
-                WHERE target_id = %s
-                ORDER BY relationship, confidence DESC
-            """, (memory_id, memory_id))
-            return [dict(r) for r in cur.fetchall()]
+        cur = conn.cursor(cursor_factory=True)
+        # IRIS UNION ALL: fetch each direction separately (avoids UNION column-count issues)
+        cur.execute(
+            f"SELECT source_id, target_id, relationship, confidence, evidence, auto_extracted, created "
+            f"FROM {db._table('typed_edges')} WHERE source_id = ? OR target_id = ? "
+            f"ORDER BY relationship, confidence DESC",
+            [memory_id, memory_id]
+        )
+        return [dict(r) for r in cur.fetchall()]
 
 
 def batch_get_edges(memory_ids: list[str], relationships: list[str] = None) -> dict[str, list[dict]]:
@@ -145,33 +189,38 @@ def batch_get_edges(memory_ids: list[str], relationships: list[str] = None) -> d
 
     db = get_db()
     result = {mid: [] for mid in memory_ids}
+    placeholders = ','.join(['?' for _ in memory_ids])
 
     with db._conn() as conn:
-        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
-            rel_filter = ""
-            params = [tuple(memory_ids)]
-            if relationships:
-                rel_filter = "AND relationship = ANY(%s)"
-                params.append(relationships)
+        cur = conn.cursor(cursor_factory=True)
 
-            cur.execute(f"""
-                SELECT *, 'outgoing' as direction FROM {db._table('typed_edges')}
-                WHERE source_id = ANY(%s) {rel_filter}
-                UNION ALL
-                SELECT *, 'incoming' as direction FROM {db._table('typed_edges')}
-                WHERE target_id = ANY(%s) {rel_filter}
-                ORDER BY confidence DESC
-            """, params + params)  # params duplicated for both halves of UNION
+        if relationships:
+            rel_placeholders = ','.join(['?' for _ in relationships])
+            cur.execute(
+                f"SELECT source_id, target_id, relationship, confidence, evidence, auto_extracted, created "
+                f"FROM {db._table('typed_edges')} "
+                f"WHERE (source_id IN ({placeholders}) OR target_id IN ({placeholders})) "
+                f"AND relationship IN ({rel_placeholders}) "
+                f"ORDER BY confidence DESC",
+                list(memory_ids) + list(memory_ids) + list(relationships)
+            )
+        else:
+            cur.execute(
+                f"SELECT source_id, target_id, relationship, confidence, evidence, auto_extracted, created "
+                f"FROM {db._table('typed_edges')} "
+                f"WHERE source_id IN ({placeholders}) OR target_id IN ({placeholders}) "
+                f"ORDER BY confidence DESC",
+                list(memory_ids) + list(memory_ids)
+            )
 
-            for row in cur.fetchall():
-                row = dict(row)
-                # Assign to the memory that owns this edge
-                sid = row.get('source_id', '')
-                tid = row.get('target_id', '')
-                if sid in result:
-                    result[sid].append(row)
-                if tid in result and tid != sid:
-                    result[tid].append(row)
+        for row in cur.fetchall():
+            row = dict(row)
+            sid = row.get('source_id', '')
+            tid = row.get('target_id', '')
+            if sid in result:
+                result[sid].append(row)
+            if tid in result and tid != sid:
+                result[tid].append(row)
 
     return result
 
@@ -180,138 +229,202 @@ def delete_edge(source_id: str, target_id: str, relationship: str) -> bool:
     """Delete a specific typed relationship."""
     db = get_db()
     with db._conn() as conn:
-        with conn.cursor() as cur:
-            cur.execute(f"""
-                DELETE FROM {db._table('typed_edges')}
-                WHERE source_id = %s AND target_id = %s AND relationship = %s
-            """, (source_id, target_id, relationship))
-            return cur.rowcount > 0
+        cur = conn.cursor()
+        cur.execute(
+            f"DELETE FROM {db._table('typed_edges')} "
+            f"WHERE source_id = ? AND target_id = ? AND relationship = ?",
+            [source_id, target_id, relationship]
+        )
+        return True  # IRIS doesn't expose rowcount reliably
 
 
 # --- Multi-Hop Traversal ---
 
+def _hop_query(cur, table: str, frontier: list[str], direction: str,
+               relationship: str, min_confidence: float) -> list[dict]:
+    """Issue a single batched query for one BFS hop across the entire frontier.
+
+    Models IVG's kg_NEIGHBORHOOD_EXPANSION pattern: one IN query per hop instead
+    of N per-node queries, holding a single open cursor throughout the traversal.
+
+    IRIS does not support ANY(%s) array parameters, so we expand the IN list
+    with individual placeholders: IN (?, ?, ...).
+    """
+    if not frontier:
+        return []
+
+    placeholders = ','.join(['?' for _ in frontier])
+    rel_clause = "AND relationship = ?" if relationship else ""
+
+    if direction == 'outgoing':
+        where = f"source_id IN ({placeholders})"
+        base_params = list(frontier)
+    elif direction == 'incoming':
+        where = f"target_id IN ({placeholders})"
+        base_params = list(frontier)
+    else:  # both
+        where = f"(source_id IN ({placeholders}) OR target_id IN ({placeholders}))"
+        base_params = list(frontier) + list(frontier)
+
+    rel_params = [relationship] if relationship else []
+    params = base_params + rel_params + [min_confidence]
+
+    cur.execute(
+        f"SELECT source_id, target_id, relationship, confidence, evidence "
+        f"FROM {table} WHERE {where} {rel_clause} AND confidence >= ?",
+        params
+    )
+    return [dict(r) for r in cur.fetchall()]
+
+
 def traverse(start_id: str, relationship: str = None,
              hops: int = 2, direction: str = 'outgoing',
              min_confidence: float = 0.3) -> list[dict]:
-    """
-    Multi-hop graph traversal using recursive CTE.
+    """Multi-hop BFS traversal. Prefers IVG native khop() when node is in Graph_KG.
+
+    Primary path: IVG khop() via ^KG global / BFSFastJson — O(hops) SQL round-trips,
+    uses ObjectScript-accelerated ^KG global (feeds khop, Cypher, PPR natively).
+
+    Fallback path: batched IN-list BFS on DriftMem_drift_typed_edges — used when
+    node is not yet mirrored into Graph_KG (e.g. during tests before backfill).
 
     Args:
-        start_id: Starting memory ID
-        relationship: Filter to specific relationship type (or None for all)
-        hops: Maximum traversal depth
-        direction: 'outgoing' (follow source->target), 'incoming' (target->source), 'both'
-        min_confidence: Minimum edge confidence to follow
+        start_id: Starting memory ID.
+        relationship: Filter to specific relationship type (None = all).
+        hops: Maximum traversal depth.
+        direction: 'outgoing', 'incoming', or 'both'.
+        min_confidence: Minimum edge confidence threshold.
 
     Returns:
-        List of reachable edges with depth information
+        List of edge dicts with added 'depth' field, sorted by (depth, -confidence).
     """
+    # --- IVG native path ---
+    try:
+        from ivg_bridge import ivg_traverse
+        result = ivg_traverse(start_id, relationship=relationship, hops=hops,
+                              direction=direction, min_confidence=min_confidence)
+        if result or _node_in_kg(start_id):
+            return result
+        # Empty + not in KG → fall through to SQL BFS
+    except Exception:
+        pass
+
+    # --- SQL BFS fallback (original implementation) ---
     db = get_db()
     table = db._table('typed_edges')
 
-    # Build direction-specific SQL
-    if direction == 'outgoing':
-        base_where = "source_id = %s"
-        join_on = "te.source_id = gt.target_id"
-    elif direction == 'incoming':
-        base_where = "target_id = %s"
-        join_on = "te.target_id = gt.source_id"
-    else:  # both
-        base_where = "(source_id = %s OR target_id = %s)"
-        join_on = "(te.source_id = gt.target_id OR te.target_id = gt.source_id)"
-
-    # Build base and recursive relationship clauses with table aliases
-    base_rel_clause = "AND relationship = %s" if relationship else ""
-    rec_rel_clause = "AND te.relationship = %s" if relationship else ""
-
-    params = []
-    if direction == 'both':
-        params.extend([start_id, start_id])
-    else:
-        params.append(start_id)
-    if relationship:
-        params.append(relationship)
-    params.append(min_confidence)
-
-    # Recursive params
-    params.append(hops)
-    if relationship:
-        params.append(relationship)
-    params.append(min_confidence)
+    visited_nodes = {start_id}
+    frontier = [start_id]
+    all_edges: list[dict] = []
+    seen_edges: set = set()
 
     with db._conn() as conn:
-        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
-            cur.execute(f"""
-                WITH RECURSIVE graph_traverse AS (
-                    SELECT source_id, target_id, relationship, confidence,
-                           evidence, 1 as depth,
-                           ARRAY[source_id, target_id] as path
-                    FROM {table}
-                    WHERE {base_where} {base_rel_clause}
-                    AND confidence >= %s
+        cur = conn.cursor(cursor_factory=True)
 
-                    UNION ALL
+        for depth in range(1, hops + 1):
+            edges = _hop_query(cur, table, frontier, direction, relationship, min_confidence)
+            next_frontier: list[str] = []
 
-                    SELECT te.source_id, te.target_id, te.relationship, te.confidence,
-                           te.evidence, gt.depth + 1,
-                           gt.path || te.target_id
-                    FROM {table} te
-                    JOIN graph_traverse gt ON {join_on}
-                    WHERE gt.depth < %s
-                    {rec_rel_clause}
-                    AND te.confidence >= %s
-                    AND NOT te.target_id = ANY(gt.path)
-                )
-                SELECT DISTINCT source_id, target_id, relationship, confidence,
-                       evidence, depth
-                FROM graph_traverse
-                ORDER BY depth, confidence DESC
-            """, params)
-            return [dict(r) for r in cur.fetchall()]
+            for edge in edges:
+                edge_key = (edge.get('source_id'), edge.get('target_id'), edge.get('relationship'))
+                if edge_key in seen_edges:
+                    continue
+                seen_edges.add(edge_key)
+                edge['depth'] = depth
+                all_edges.append(edge)
+
+                src, tgt = edge.get('source_id'), edge.get('target_id')
+                if direction == 'outgoing':
+                    next_node = tgt
+                elif direction == 'incoming':
+                    next_node = src
+                else:
+                    next_node = tgt if src in visited_nodes else src
+
+                if next_node and next_node not in visited_nodes:
+                    visited_nodes.add(next_node)
+                    next_frontier.append(next_node)
+
+            frontier = next_frontier
+            if not frontier:
+                break
+
+    all_edges.sort(key=lambda e: (e.get('depth', 0), -float(e.get('confidence') or 0)))
+    return all_edges
 
 
-def find_path(id1: str, id2: str, max_hops: int = 5) -> Optional[list[dict]]:
-    """
-    Find shortest typed path between two memories (BFS).
+def _node_in_kg(memory_id: str) -> bool:
+    """Check whether a drift-memory node is registered in Graph_KG."""
+    try:
+        from ivg_bridge import _get_conn, _drift_node_id
+        conn = _get_conn()
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT COUNT(*) FROM Graph_KG.nodes WHERE node_id = ?",
+            [_drift_node_id(memory_id)]
+        )
+        result = cur.fetchone()[0] > 0
+        conn.close()
+        return result
+    except Exception:
+        return False
+
+
+def find_path(id1: str, id2: str, max_hops: int = 5) -> Optional[dict]:
+    """Find shortest typed path between two memories.
+
+    Primary path: IVG native ivg_find_path() using khop() neighborhood expansion.
+    Fallback: batched IN-list BFS on DriftMem_drift_typed_edges.
 
     Returns:
-        List of edges forming the path, or None if no path exists
+        Dict with 'depth' and 'edges' (list of edge dicts), or None if no path.
     """
+    # --- IVG native path ---
+    try:
+        from ivg_bridge import ivg_find_path
+        if _node_in_kg(id1):
+            return ivg_find_path(id1, id2, max_hops=max_hops)
+    except Exception:
+        pass
+
+    # --- SQL BFS fallback ---
     db = get_db()
     table = db._table('typed_edges')
 
+    visited = {id1}
+    frontier_paths: dict[str, list[dict]] = {id1: []}
+
     with db._conn() as conn:
-        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
-            cur.execute(f"""
-                WITH RECURSIVE path_search AS (
-                    SELECT source_id, target_id, relationship, confidence,
-                           1 as depth,
-                           ARRAY[source_id] as visited,
-                           ARRAY[ROW(source_id, target_id, relationship, confidence)::text] as edges
-                    FROM {table}
-                    WHERE source_id = %s
+        cur = conn.cursor(cursor_factory=True)
 
-                    UNION ALL
+        for _ in range(max_hops):
+            if not frontier_paths:
+                break
+            frontier = list(frontier_paths.keys())
+            placeholders = ','.join(['?' for _ in frontier])
 
-                    SELECT te.source_id, te.target_id, te.relationship, te.confidence,
-                           ps.depth + 1,
-                           ps.visited || te.source_id,
-                           ps.edges || ROW(te.source_id, te.target_id, te.relationship, te.confidence)::text
-                    FROM {table} te
-                    JOIN path_search ps ON te.source_id = ps.target_id
-                    WHERE ps.depth < %s
-                    AND NOT te.source_id = ANY(ps.visited)
-                )
-                SELECT edges, depth
-                FROM path_search
-                WHERE target_id = %s
-                ORDER BY depth
-                LIMIT 1
-            """, (id1, max_hops, id2))
-            row = cur.fetchone()
-            if row:
-                return {'depth': row['depth'], 'edges': row['edges']}
-            return None
+            cur.execute(
+                f"SELECT source_id, target_id, relationship, confidence "
+                f"FROM {table} WHERE source_id IN ({placeholders})",
+                frontier
+            )
+            edges = [dict(r) for r in cur.fetchall()]
+
+            next_frontier_paths: dict[str, list[dict]] = {}
+            for edge in edges:
+                src, tgt = edge.get('source_id'), edge.get('target_id')
+                if not src or not tgt:
+                    continue
+                new_path = frontier_paths[src] + [edge]
+                if tgt == id2:
+                    return {'depth': len(new_path), 'edges': new_path}
+                if tgt not in visited:
+                    visited.add(tgt)
+                    next_frontier_paths[tgt] = new_path
+
+            frontier_paths = next_frontier_paths
+
+    return None
 
 
 # --- Statistics ---
@@ -320,48 +433,45 @@ def get_stats() -> dict:
     """Get typed edge statistics."""
     db = get_db()
     with db._conn() as conn:
-        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
-            cur.execute(f"""
-                SELECT
-                    COUNT(*) as total,
-                    COUNT(*) FILTER (WHERE auto_extracted) as auto_extracted,
-                    COUNT(*) FILTER (WHERE NOT auto_extracted) as manual,
-                    COUNT(DISTINCT relationship) as types_used,
-                    COUNT(DISTINCT source_id) as unique_sources,
-                    COUNT(DISTINCT target_id) as unique_targets,
-                    AVG(confidence) as avg_confidence
-                FROM {db._table('typed_edges')}
-            """)
-            row = dict(cur.fetchone())
-            row['avg_confidence'] = round(float(row['avg_confidence'] or 0), 3)
+        cur = conn.cursor(cursor_factory=True)
+        cur.execute(f"""
+            SELECT
+                COUNT(*) as total,
+                SUM(CASE WHEN auto_extracted = 1 THEN 1 ELSE 0 END) as auto_extracted,
+                SUM(CASE WHEN auto_extracted = 0 THEN 1 ELSE 0 END) as manual,
+                COUNT(DISTINCT relationship) as types_used,
+                COUNT(DISTINCT source_id) as unique_sources,
+                COUNT(DISTINCT target_id) as unique_targets,
+                AVG(confidence) as avg_confidence
+            FROM {db._table('typed_edges')}
+        """)
+        row = dict(cur.fetchone())
+        row['avg_confidence'] = round(float(row['avg_confidence'] or 0), 3)
 
-            # Type distribution
-            cur.execute(f"""
-                SELECT relationship, COUNT(*) as count,
-                       AVG(confidence) as avg_conf
-                FROM {db._table('typed_edges')}
-                GROUP BY relationship
-                ORDER BY count DESC
-            """)
-            row['by_type'] = {
-                r['relationship']: {
-                    'count': r['count'],
-                    'avg_confidence': round(float(r['avg_conf'] or 0), 3)
-                }
-                for r in cur.fetchall()
+        # Type distribution
+        cur.execute(f"""
+            SELECT relationship, COUNT(*) as count,
+                   AVG(confidence) as avg_conf
+            FROM {db._table('typed_edges')}
+            GROUP BY relationship
+            ORDER BY count DESC
+        """)
+        row['by_type'] = {
+            r['relationship']: {
+                'count': r['count'],
+                'avg_confidence': round(float(r['avg_conf'] or 0), 3)
             }
+            for r in cur.fetchall()
+        }
 
-            # Density: typed edges / total possible (memories^2)
-            cur.execute(f"""
-                SELECT COUNT(*) as cnt FROM {db._table('memories')}
-                WHERE type IN ('core', 'active')
-            """)
-            mem_count = cur.fetchone()['cnt']
-            row['memory_count'] = mem_count
-            max_possible = mem_count * (mem_count - 1) if mem_count > 1 else 1
-            row['density'] = round(row['total'] / max_possible, 6) if max_possible > 0 else 0
+        # Density: typed edges / total possible (memories^2)
+        cur.execute(f"SELECT COUNT(*) as cnt FROM {db._table('memories')} WHERE type_ IN ('core', 'active')")
+        mem_count = cur.fetchone()['cnt']
+        row['memory_count'] = mem_count
+        max_possible = mem_count * (mem_count - 1) if mem_count > 1 else 1
+        row['density'] = round(row['total'] / max_possible, 6) if max_possible > 0 else 0
 
-            return row
+        return row
 
 
 # --- Auto-Extraction Pipeline ---
@@ -509,22 +619,21 @@ def _link_by_tag_hierarchy(memory_id: str, child_tag: str, parent_tag: str,
                            db, created: list, limit: int = 5):
     """Create part_of edges between memories in tag hierarchies."""
     with db._conn() as conn:
-        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
-            cur.execute(f"""
-                SELECT id FROM {db._table('memories')}
-                WHERE id != %s
-                AND type IN ('core', 'active')
-                AND %s = ANY(tags)
-                AND NOT (%s = ANY(tags))
-                LIMIT %s
-            """, (memory_id, parent_tag, child_tag, limit))
-            for row in cur.fetchall():
-                edge = add_edge(memory_id, row['id'], 'part_of',
-                                confidence=0.65,
-                                evidence=f'tag hierarchy: {child_tag} part_of {parent_tag}',
-                                auto_extracted=True)
-                if edge:
-                    created.append(edge)
+        cur = conn.cursor(cursor_factory=True)
+        # tags stored as CSV — use LIKE to match tag presence; exclude memories with child_tag
+        cur.execute(
+            f"SELECT TOP ? id FROM {db._table('memories')} "
+            f"WHERE id != ? AND type_ IN ('core', 'active') "
+            f"AND tags LIKE ? AND tags NOT LIKE ?",
+            [limit, memory_id, f'%{parent_tag}%', f'%{child_tag}%']
+        )
+        for row in cur.fetchall():
+            edge = add_edge(memory_id, row['id'], 'part_of',
+                            confidence=0.65,
+                            evidence=f'tag hierarchy: {child_tag} part_of {parent_tag}',
+                            auto_extracted=True)
+            if edge:
+                created.append(edge)
 
 
 def _extract_references(memory_id: str, content: str, db, created: list):
@@ -548,25 +657,22 @@ def _extract_references(memory_id: str, content: str, db, created: list):
 def _link_by_entities(memory_id: str, entity_names: set, db, created: list,
                       limit: int = 10):
     """Find other memories sharing entities and create collaborator edges."""
-    # Find memories with overlapping entities (limited scan)
     with db._conn() as conn:
-        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
-            # Search entities JSONB for matching names
-            for name in list(entity_names)[:5]:  # Cap at 5 entities
-                cur.execute(f"""
-                    SELECT id FROM {db._table('memories')}
-                    WHERE id != %s
-                    AND type IN ('core', 'active')
-                    AND entities::text ILIKE %s
-                    LIMIT %s
-                """, (memory_id, f'%{name}%', limit))
-                for row in cur.fetchall():
-                    edge = add_edge(memory_id, row['id'], 'collaborator',
-                                    confidence=0.6,
-                                    evidence=f'shared entity: {name}',
-                                    auto_extracted=True)
-                    if edge:
-                        created.append(edge)
+        cur = conn.cursor(cursor_factory=True)
+        # entities stored as JSON text — use LIKE for substring match (IRIS has no ILIKE)
+        for name in list(entity_names)[:5]:  # Cap at 5 entities
+            cur.execute(
+                f"SELECT TOP ? id FROM {db._table('memories')} "
+                f"WHERE id != ? AND type_ IN ('core', 'active') AND entities LIKE ?",
+                [limit, memory_id, f'%{name}%']
+            )
+            for row in cur.fetchall():
+                edge = add_edge(memory_id, row['id'], 'collaborator',
+                                confidence=0.6,
+                                evidence=f'shared entity: {name}',
+                                auto_extracted=True)
+                if edge:
+                    created.append(edge)
 
 
 def extract_similarity_edges(limit: int = 200, threshold: float = 0.85,
@@ -574,8 +680,9 @@ def extract_similarity_edges(limit: int = 200, threshold: float = 0.85,
     """
     Extract 'similar_to' edges using embedding cosine similarity.
 
-    Finds pairs of memories with high semantic similarity that don't
-    already have a similar_to edge. Uses pgvector's cosine distance.
+    Uses IRIS VECTOR_COSINE for pair scoring (replaces pgvector <=> which does
+    not exist on IRIS). Iterates over all memories with embeddings, finds their
+    top-k neighbors using VECTOR_COSINE, and creates similar_to edges above threshold.
 
     Args:
         limit: Max new edges to create
@@ -583,52 +690,99 @@ def extract_similarity_edges(limit: int = 200, threshold: float = 0.85,
         verbose: Print progress
 
     Returns:
-        Dict with edges_created count
+        Dict with edges_created count and pairs_found count
     """
     db = get_db()
+    emb_table = db._table('text_embeddings')
+    edges_table = db._table('typed_edges')
+    mem_table = db._table('memories')
     created = 0
+    pairs_found = 0
+
+    # Fetch IDs + embeddings for core/active memories that have VECTOR emb set
+    with db._conn() as conn:
+        cur = conn.cursor(cursor_factory=True)
+        cur.execute(f"""
+            SELECT e.memory_id
+            FROM {emb_table} e
+            JOIN {mem_table} m ON m.id = e.memory_id
+            WHERE e.emb IS NOT NULL AND m.type_ IN ('core', 'active')
+        """)
+        candidate_ids = [r['memory_id'] for r in cur.fetchall()]
+
+    if verbose:
+        print(f"  Scanning {len(candidate_ids)} candidate memories for similar_to edges")
+
+    seen_pairs: set = set()
 
     with db._conn() as conn:
-        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
-            # Find high-similarity pairs that don't already have similar_to edges
-            # Uses pgvector's <=> operator (cosine distance, so 1-distance = similarity)
-            # Embeddings are in text_embeddings table, not memories
-            emb_table = db._table('text_embeddings')
-            cur.execute(f"""
-                SELECT e1.memory_id as id1, e2.memory_id as id2,
-                       1 - (e1.embedding <=> e2.embedding) as similarity
-                FROM {emb_table} e1
-                JOIN {emb_table} e2
-                    ON e1.memory_id < e2.memory_id
-                JOIN {db._table('memories')} m1 ON m1.id = e1.memory_id
-                JOIN {db._table('memories')} m2 ON m2.id = e2.memory_id
-                WHERE m1.type IN ('core', 'active')
-                AND m2.type IN ('core', 'active')
-                AND 1 - (e1.embedding <=> e2.embedding) >= %s
-                AND NOT EXISTS (
-                    SELECT 1 FROM {db._table('typed_edges')} te
-                    WHERE te.source_id = e1.memory_id AND te.target_id = e2.memory_id
-                    AND te.relationship = 'similar_to'
-                )
-                ORDER BY similarity DESC
-                LIMIT %s
-            """, (threshold, limit))
+        cur = conn.cursor(cursor_factory=True)
 
-            pairs = cur.fetchall()
-            if verbose:
-                print(f"  Found {len(pairs)} high-similarity pairs above {threshold}")
+        for mid in candidate_ids:
+            if created >= limit:
+                break
 
-            for pair in pairs:
-                edge = add_edge(pair['id1'], pair['id2'], 'similar_to',
-                                confidence=round(float(pair['similarity']), 3),
-                                evidence=f'cosine similarity {pair["similarity"]:.3f}',
+            # Get embedding for this memory
+            cur.execute(
+                f"SELECT embedding FROM {emb_table} WHERE memory_id = ?",
+                [mid]
+            )
+            row = cur.fetchone()
+            if not row or not row.get('embedding'):
+                continue
+
+            emb_str = row['embedding']
+
+            # Find top-10 similar neighbors using VECTOR_COSINE
+            try:
+                cur.execute(f"""
+                    SELECT TOP 10 e.memory_id,
+                           VECTOR_COSINE(e.emb, TO_VECTOR(?, DOUBLE)) as similarity
+                    FROM {emb_table} e
+                    JOIN {mem_table} m ON m.id = e.memory_id
+                    WHERE e.emb IS NOT NULL
+                      AND e.memory_id != ?
+                      AND m.type_ IN ('core', 'active')
+                    ORDER BY similarity DESC
+                """, [emb_str, mid])
+                neighbors = [(r['memory_id'], r['similarity']) for r in cur.fetchall()]
+            except Exception:
+                continue
+
+            for neighbor_id, raw_sim in neighbors:
+                try:
+                    similarity = float(raw_sim)
+                except (TypeError, ValueError):
+                    continue
+
+                if similarity < threshold:
+                    break  # results are ordered DESC, so no need to continue
+
+                # Canonical pair key (smaller id first) to avoid duplicates
+                pair_key = (min(mid, neighbor_id), max(mid, neighbor_id))
+                if pair_key in seen_pairs:
+                    continue
+                seen_pairs.add(pair_key)
+                pairs_found += 1
+
+                # Skip if edge already exists
+                cur.execute(f"""
+                    SELECT 1 FROM {edges_table}
+                    WHERE source_id = ? AND target_id = ? AND relationship = 'similar_to'
+                """, [pair_key[0], pair_key[1]])
+                if cur.fetchone():
+                    continue
+
+                edge = add_edge(pair_key[0], pair_key[1], 'similar_to',
+                                confidence=round(similarity, 3),
+                                evidence=f'cosine similarity {similarity:.3f}',
                                 auto_extracted=True)
                 if edge:
                     created += 1
                     if verbose and created % 50 == 0:
                         print(f"    ... {created} similar_to edges created")
 
-    return {'edges_created': created, 'pairs_found': len(pairs)}
+    return {'edges_created': created, 'pairs_found': pairs_found}
 
 
 def extract_temporal_edges(limit: int = 500, verbose: bool = False) -> dict:
@@ -641,31 +795,26 @@ def extract_temporal_edges(limit: int = 500, verbose: bool = False) -> dict:
     created = 0
 
     with db._conn() as conn:
-        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
-            # Find causal pairs and add temporal ordering
-            cur.execute(f"""
-                SELECT te.source_id, te.target_id, m1.created as source_time, m2.created as target_time
-                FROM {db._table('typed_edges')} te
-                JOIN {db._table('memories')} m1 ON m1.id = te.source_id
-                JOIN {db._table('memories')} m2 ON m2.id = te.target_id
-                WHERE te.relationship = 'causes'
-                AND NOT EXISTS (
-                    SELECT 1 FROM {db._table('typed_edges')} te2
-                    WHERE te2.source_id = te.source_id AND te2.target_id = te.target_id
-                    AND te2.relationship = 'temporal_before'
-                )
-                LIMIT %s
-            """, (limit,))
+        cur = conn.cursor(cursor_factory=True)
+        cur.execute(f"""
+            SELECT TOP ? te.source_id, te.target_id
+            FROM {db._table('typed_edges')} te
+            WHERE te.relationship = 'causes'
+            AND NOT EXISTS (
+                SELECT 1 FROM {db._table('typed_edges')} te2
+                WHERE te2.source_id = te.source_id AND te2.target_id = te.target_id
+                AND te2.relationship = 'temporal_before'
+            )
+        """, [limit])
 
-            pairs = cur.fetchall()
-            for pair in pairs:
-                # Cause happened before effect
-                edge = add_edge(pair['source_id'], pair['target_id'], 'temporal_before',
-                                confidence=0.90,
-                                evidence='causal ordering implies temporal ordering',
-                                auto_extracted=True)
-                if edge:
-                    created += 1
+        pairs = cur.fetchall()
+        for pair in pairs:
+            edge = add_edge(pair['source_id'], pair['target_id'], 'temporal_before',
+                            confidence=0.90,
+                            evidence='causal ordering implies temporal ordering',
+                            auto_extracted=True)
+            if edge:
+                created += 1
 
     return {'edges_created': created}
 
@@ -682,18 +831,19 @@ def extract_all(limit: int = 500, verbose: bool = False) -> dict:
     # Get memories that haven't been processed yet
     # (check if they have any auto-extracted outgoing edges)
     with db._conn() as conn:
-        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
-            cur.execute(f"""
-                SELECT m.id
-                FROM {db._table('memories')} m
-                LEFT JOIN {db._table('typed_edges')} te
-                    ON te.source_id = m.id AND te.auto_extracted = TRUE
-                WHERE m.type IN ('core', 'active')
-                AND te.id IS NULL
-                ORDER BY m.created DESC
-                LIMIT %s
-            """, (limit,))
-            ids_to_process = [r['id'] for r in cur.fetchall()]
+        cur = conn.cursor(cursor_factory=True)
+        # Find memories with no auto-extracted outgoing edges yet
+        cur.execute(f"""
+            SELECT TOP ? m.id
+            FROM {db._table('memories')} m
+            WHERE m.type_ IN ('core', 'active')
+            AND NOT EXISTS (
+                SELECT 1 FROM {db._table('typed_edges')} te
+                WHERE te.source_id = m.id AND te.auto_extracted = 1
+            )
+            ORDER BY m.created DESC
+        """, [limit])
+        ids_to_process = [r['id'] for r in cur.fetchall()]
 
     total_edges = 0
     by_type = {}
